@@ -29,6 +29,14 @@ const CDN_BASE = "https://novac2c.cdn.weixin.qq.com/c2c";
 const LONG_POLL_MS = 35_000;
 const API_TIMEOUT_MS = 15_000;
 const ERR_SESSION_EXPIRED = -14;
+const MEDIA_TIMEOUT_MS = 120_000;
+
+// 入站文件名来自对端，必须去掉目录部分，防止 ../ 路径穿越写出 media 目录
+export function safeMediaName(label) {
+  const base = path.basename(String(label || "file").replace(/\\/g, "/"));
+  const cleaned = base.replace(/[\x00-\x1f]/g, "").replace(/^\.+/, "").slice(0, 120);
+  return cleaned || "file";
+}
 
 export const ITEM = { TEXT: 1, IMAGE: 2, VOICE: 3, FILE: 4, VIDEO: 5 };
 export const MSG_TYPE = { USER: 1, BOT: 2 };
@@ -283,13 +291,14 @@ async function downloadMedia(media, label) {
   const fullUrl = media?.full_url || "";
   if (!param && !fullUrl) return null;
   const url = fullUrl || `${CDN_BASE}/download?encrypted_query_param=${encodeURIComponent(param)}`;
-  const res = await fetch(url);
+  const res = await fetch(url, { signal: AbortSignal.timeout(MEDIA_TIMEOUT_MS) });
   if (!res.ok) throw new Error(`下载媒体失败 ${res.status}`);
   const cipher = Buffer.from(await res.arrayBuffer());
   const key = parseAesKey(media.aes_key);
   const plain = aesEcb(cipher, key, "decrypt");
-  const file = path.join(paths().media, `${Date.now()}-${label}`);
-  fs.writeFileSync(file, plain);
+  fs.mkdirSync(paths().media, { recursive: true, mode: 0o700 });
+  const file = path.join(paths().media, `${Date.now()}-${safeMediaName(label)}`);
+  fs.writeFileSync(file, plain, { mode: 0o600 });
   return file;
 }
 
@@ -437,6 +446,7 @@ async function uploadFile(account, to, filePath, mediaType) {
     || `${CDN_BASE}/upload?encrypted_query_param=${encodeURIComponent(upload.upload_param || "")}&filekey=${encodeURIComponent(filekey)}`;
   const res = await fetch(uploadUrl, {
     method: "POST",
+    signal: AbortSignal.timeout(MEDIA_TIMEOUT_MS),
     headers: { "Content-Type": "application/octet-stream" },
     body: cipher,
   });
@@ -539,6 +549,7 @@ export function statusPayload() {
 export async function probeWake(url, key) {
   const res = await fetch(url, {
     method: "POST",
+    signal: AbortSignal.timeout(API_TIMEOUT_MS),
     headers: {
       Authorization: `Bearer ${key}`,
       "Content-Type": "application/json",

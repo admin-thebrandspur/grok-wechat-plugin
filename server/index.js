@@ -37,13 +37,6 @@ import { registerShutdownCleanup, touchConnectorActive, connectorAbandoned, runU
 const self = fileURLToPath(import.meta.url);
 
 try {
-  fs.mkdirSync("/workspace/.grok-wechat", { recursive: true });
-  fs.appendFileSync(
-    "/workspace/.grok-wechat/mcp-host.log",
-    `${new Date().toISOString()} spawn pid=${process.pid} argv=${JSON.stringify(process.argv)} cwd=${process.cwd()}\n`,
-  );
-} catch { /* ignore */ }
-try {
   if (process.stdout._handle?.setBlocking) process.stdout._handle.setBlocking(true);
   if (process.stdin._handle?.setBlocking) process.stdin._handle.setBlocking(true);
 } catch { /* ignore */ }
@@ -295,15 +288,9 @@ async function dispatch(name, args) {
 function writeMessage(msg) {
   const json = JSON.stringify(msg);
   fs.writeSync(1, json + "\n");
-  try {
-    fs.appendFileSync("/workspace/.grok-wechat/mcp-host.log", `${new Date().toISOString()} out ${json.slice(0, 200)}\n`);
-  } catch { /* ignore */ }
 }
 
 async function onRpc(msg) {
-  try {
-    fs.appendFileSync("/workspace/.grok-wechat/mcp-host.log", `${new Date().toISOString()} in ${JSON.stringify({id: msg.id, method: msg.method}).slice(0,300)}\n`);
-  } catch { /* ignore */ }
   const { id, method, params } = msg;
   if (method === "initialize") {
     touchConnectorActive();
@@ -337,27 +324,33 @@ function startMcp() {
   registerShutdownCleanup();
   ensureMonitor();
   let buf = Buffer.alloc(0);
-  process.stdin.on("data", async (chunk) => {
-    buf = Buffer.concat([buf, chunk]);
+  let chain = Promise.resolve();
+  const handle = async (raw) => {
+    try {
+      const reply = await onRpc(JSON.parse(raw));
+      if (reply) writeMessage(reply);
+    } catch (err) {
+      writeMessage({ jsonrpc: "2.0", id: null, error: { code: -32700, message: String(err) } });
+    }
+  };
+  // 按缓冲区开头判断分帧：「{」为换行分隔 JSON，否则为 Content-Length 头。
+  // 处理串行化，避免并发的 data 事件重复消费同一段缓冲。
+  const drain = async () => {
     while (true) {
-      const headerEnd = buf.indexOf("\r\n\r\n");
-      if (headerEnd === -1) {
+      let skip = 0;
+      while (skip < buf.length && (buf[skip] === 0x0a || buf[skip] === 0x0d || buf[skip] === 0x20 || buf[skip] === 0x09)) skip += 1;
+      if (skip) buf = buf.slice(skip);
+      if (!buf.length) return;
+      if (buf[0] === 0x7b) {
         const nl = buf.indexOf("\n");
-        if (nl !== -1) {
-          const line = buf.slice(0, nl).toString("utf8").trim();
-          buf = buf.slice(nl + 1);
-          if (line.startsWith("{")) {
-            try {
-              const reply = await onRpc(JSON.parse(line));
-              if (reply) writeMessage(reply);
-            } catch (err) {
-              writeMessage({ jsonrpc: "2.0", id: null, error: { code: -32700, message: String(err) } });
-            }
-            continue;
-          }
-        }
-        break;
+        if (nl === -1) return;
+        const line = buf.slice(0, nl).toString("utf8").trim();
+        buf = buf.slice(nl + 1);
+        await handle(line);
+        continue;
       }
+      const headerEnd = buf.indexOf("\r\n\r\n");
+      if (headerEnd === -1) return;
       const header = buf.slice(0, headerEnd).toString("utf8");
       const match = header.match(/Content-Length:\s*(\d+)/i);
       if (!match) {
@@ -366,16 +359,15 @@ function startMcp() {
       }
       const len = Number(match[1]);
       const start = headerEnd + 4;
-      if (buf.length < start + len) break;
+      if (buf.length < start + len) return;
       const body = buf.slice(start, start + len).toString("utf8");
       buf = buf.slice(start + len);
-      try {
-        const reply = await onRpc(JSON.parse(body));
-        if (reply) writeMessage(reply);
-      } catch (err) {
-        writeMessage({ jsonrpc: "2.0", id: null, error: { code: -32700, message: String(err) } });
-      }
+      await handle(body);
     }
+  };
+  process.stdin.on("data", (chunk) => {
+    buf = Buffer.concat([buf, chunk]);
+    chain = chain.then(drain);
   });
 }
 
@@ -403,6 +395,7 @@ async function wakeAgent(messages, log) {
           Authorization: `Bearer ${cfg.key}`,
           "Content-Type": "application/json",
         },
+        signal: AbortSignal.timeout(15_000),
         body: JSON.stringify({
           source: "grok-wechat",
           count: batch.length,
@@ -451,8 +444,8 @@ async function runMonitor() {
   while (true) {
     try {
       if (connectorAbandoned()) {
-        log("connector removed, running uninstall");
-        runUninstall();
+        log("mcp host gone, stopping monitor (state kept; use wechat_uninstall to remove)");
+        clearPid();
         process.exit(0);
       }
       const accountsNow = listAccounts();

@@ -49,8 +49,12 @@ export function emptyState() {
 
 function ensureHome() {
   const { home, media } = paths();
-  fs.mkdirSync(home, { recursive: true });
-  fs.mkdirSync(media, { recursive: true });
+  fs.mkdirSync(home, { recursive: true, mode: 0o700 });
+  fs.mkdirSync(media, { recursive: true, mode: 0o700 });
+  // 目录里有 bot token 与聊天内容，只允许本人访问
+  for (const dir of [home, media]) {
+    try { fs.chmodSync(dir, 0o700); } catch { /* ignore */ }
+  }
 }
 
 function migrateLegacyState(raw) {
@@ -91,7 +95,8 @@ export function saveState(next) {
   ensureHome();
   const { state } = paths();
   const tmp = `${state}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(next, null, 2));
+  fs.writeFileSync(tmp, JSON.stringify(next, null, 2), { mode: 0o600 });
+  fs.chmodSync(tmp, 0o600);
   fs.renameSync(tmp, state);
 }
 
@@ -204,14 +209,21 @@ export function appendInbox(messages) {
   ensureHome();
   const { inbox } = paths();
   const lines = messages.map((m) => JSON.stringify(m)).join("\n") + "\n";
-  fs.appendFileSync(inbox, lines);
+  fs.appendFileSync(inbox, lines, { mode: 0o600 });
 }
 
 export function drainInbox() {
   const { inbox } = paths();
-  if (!fs.existsSync(inbox)) return [];
-  const raw = fs.readFileSync(inbox, "utf8");
-  fs.writeFileSync(inbox, "");
+  // 先原子改名再读取：monitor 此后追加会写入新文件，避免读与清空之间丢消息
+  const draining = `${inbox}.${process.pid}.${Date.now()}.draining`;
+  try {
+    fs.renameSync(inbox, draining);
+  } catch (err) {
+    if (err?.code === "ENOENT") return [];
+    throw err;
+  }
+  const raw = fs.readFileSync(draining, "utf8");
+  fs.unlinkSync(draining);
   return raw
     .split("\n")
     .map((line) => line.trim())
@@ -386,7 +398,8 @@ export function saveGlobalWake(url, key) {
   ensureHome();
   const wakeFile = fallbackWakePath();
   const tmp = `${wakeFile}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify({ url, key }, null, 2));
+  fs.writeFileSync(tmp, JSON.stringify({ url, key }, null, 2), { mode: 0o600 });
+  fs.chmodSync(tmp, 0o600);
   fs.renameSync(tmp, wakeFile);
   try {
     fs.chmodSync(wakeFile, 0o600);

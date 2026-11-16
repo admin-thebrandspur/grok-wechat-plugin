@@ -2,7 +2,6 @@ import { execSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 import { clearPid, homeDir, isMonitorProcess, listAccounts, loadState, monitorRunning } from "./store.js";
 
 const PLUGIN_DIR_NAMES = ["grok-wechat-plugin"];
@@ -27,18 +26,8 @@ export function knownStateHomes() {
 }
 
 export function knownPluginDirs() {
-  const dirs = new Set([
-    path.join(GROK_BOX_HOME, "grok-wechat-plugin"),
-    "/workspace/grok-wechat-plugin",
-  ]);
-  try {
-    const here = path.dirname(fileURLToPath(import.meta.url));
-    const parent = path.dirname(here);
-    if (isPluginDir(parent)) dirs.add(parent);
-  } catch {
-    // ignore
-  }
-  return [...dirs];
+  // 只删除 Grok Bot 安装位置；不删除脚本自身所在目录（可能是用户的 git 工作副本）
+  return [path.join(GROK_BOX_HOME, "grok-wechat-plugin"), "/workspace/grok-wechat-plugin"];
 }
 
 function sh(cmd) {
@@ -232,12 +221,12 @@ export function scheduleDeferredUninstall() {
 export function registerShutdownCleanup() {
   if (shutdownHookRegistered) return;
   shutdownHookRegistered = true;
-  const run = () => scheduleDeferredUninstall();
-  process.once("SIGTERM", run);
-  process.once("SIGINT", run);
-  process.once("SIGHUP", run);
-  process.stdin?.once("end", run);
-  process.stdin?.once("close", run);
+  // MCP 进程正常退出（Grok Bot 重启、断开）时不再删除登录状态与插件目录。
+  // 删除只在明确调用 wechat_uninstall / --uninstall 时进行；monitor 会在 MCP 消失后自行停止。
+  const exit = () => process.exit(0);
+  process.once("SIGTERM", exit);
+  process.once("SIGINT", exit);
+  process.once("SIGHUP", exit);
 }
 
 function collectDedicatedAssistants() {
